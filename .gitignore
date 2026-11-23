@@ -1,0 +1,13 @@
+# build output -- rebuilt by `make`
+htsim/.obj/
+htsim/.d/
+htsim/htsim
+*.o
+*.d
+
+# raw per-packet simulation traces -- regenerable via htsim/scripts/run_*.sh,
+# ~437 MB. The distilled csv/ and runs.csv ARE tracked.
+htsim/results_*/logs/
+
+# local
+.DS_Store

@@ -1,0 +1,9 @@
+config               n   p99 ratio  degradation_ms (med [min-max])   server_s  peak_fleet
+--------------------------------------------------------------------------------------
+scaler-none          3       104.1      1349 [ 1124- 4019]           1.40         4
+scaler-threshold     3        50.9       581 [  460-  778]           3.08        14
+scaler-target        3        48.9       561 [  339-  864]           2.68        13
+
+degradation_ms = integral of relative p99 inflation after the surge.
+Lower is better. Overlapping [min-max] spreads mean the difference
+between two configs is not resolved by this many seeds.

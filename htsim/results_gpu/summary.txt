@@ -1,0 +1,37 @@
+config                   n degrade_ms  warm_p50 warm_max  stor_MB  peer_MB   fleet node_s
+--------------------------------------------------------------------------------------------
+src-storage              3      54188     100.0    200.0      650        0      12   4.44
+src-peer                 3        172      10.9     57.5        0     1250      24   8.56
+src-racklocal            3       5247     105.4    186.4      450      400      17   6.36
+stor-1.2G                3     134235     333.3    333.3      150        0       7   2.42  STUCK
+stor-4G                  3      54188     100.0    200.0      650        0      12   4.44
+stor-10G                 3      10315      41.1     89.8     1100        0      22   7.40
+stor-24G                 3      10652      42.3     96.3     1100        0      22   7.43
+state-10MB-storage       3       1574      20.0     49.0      250        0      25   8.73
+state-10MB-peer          3        112       3.4     11.4        0      260      26   9.45
+state-25MB-storage       3      20711      64.9     96.6      475        0      20   6.61
+state-25MB-peer          3        215       5.9     28.6        0      650      26   9.08
+state-50MB-storage       3      54188     100.0    200.0      650        0      12   4.44
+state-50MB-peer          3        172      10.9     57.5        0     1250      24   8.56
+state-100MB-storage      3     132993     200.0    200.0      700        0       7   3.10
+state-100MB-peer         3       7097      91.4    133.3        0     1900      19   6.65
+batch-1-storage          3      63414     101.4    186.3      650        0      11   4.38
+batch-1-peer             3        436       6.3     57.3        0     1150      23   8.00
+batch-2-storage          3      59702     100.0    196.0      650        0      11   4.41
+batch-2-peer             3        305      12.9     57.3        0     1200      24   8.37
+batch-4-storage          3      54188     100.0    200.0      650        0      12   4.44
+batch-4-peer             3        172      10.9     57.5        0     1250      24   8.56
+batch-8-storage          3      54188     100.0    200.0      650        0      12   4.45
+batch-8-peer             3        177      11.8     58.1        0     1250      24   8.62
+place-packed-storage     3      54188     100.0    200.0      650        0      12   4.44
+place-packed-peer        3        172      10.9     57.5        0     1250      24   8.56
+place-roundrobin-storage   3      53667     100.0    200.0      650        0      12   4.44
+place-roundrobin-peer    3        104       4.0     54.2        0     1300      26   9.05
+par-1node                3     134107     297.3    300.0      150        0       7   2.50  STUCK
+par-2node                3     121203     194.0    200.9      350        0       8   3.33  STUCK
+par-4node                3      54188     100.0    200.0      650        0      12   4.44
+par-8node                3      52548     100.0    100.0      750        0      15   4.94
+
+degrade_ms = integral of relative p99 FCT inflation after the surge
+             (lower is better; already includes any donor cost).
+node_s     = node-seconds consumed: the compute bill for the scaling.
