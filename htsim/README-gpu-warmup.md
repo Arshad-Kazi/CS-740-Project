@@ -8,6 +8,35 @@ traffic, so "time to add capacity" is a *measured outcome*, not a parameter.
 
 ---
 
+## 0. Quick start
+
+```bash
+make                                    # -> ./htsim
+./htsim --expt=5 --warmup=storage       # single run
+./scripts/run_gpu_warmup.sh source      # storage vs peer, 3 seeds
+./scripts/run_gpu_warmup.sh all         # every sweep, ~4 min
+```
+
+A single run prints per-flow lines to stdout; the last `WarmStats` line is
+its summary (`warm_p99_ms`, `storage_mb`, `local_peer_mb`, `final_active`).
+
+Suites: `source` `storage` `state` `batch` `place` `parallel` `all`.
+The script aggregates automatically and prints the results table.
+
+Output in `results_gpu/`:
+
+| Path | Contents | In git |
+|---|---|---|
+| `runs.csv` | one row per run | yes |
+| `summary.txt` | aggregated table | yes |
+| `csv/` | per-run time series | yes |
+| `logs/` | raw packet traces | no (ignored) |
+
+> **`run_gpu_warmup.sh` truncates `runs.csv` on start.** Running one suite
+> discards the others' rows. Commit or copy `results_gpu/` before re-running.
+
+---
+
 ## 1. What it models
 
 ```
