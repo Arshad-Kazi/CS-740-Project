@@ -57,6 +57,7 @@
 #include <iomanip>
 #include <random>
 #include <vector>
+#include <algorithm>
 
 namespace autoscale {
 
@@ -125,6 +126,18 @@ namespace autoscale {
     CsigQueue *makeCsigQueue(uint64_t speed, uint64_t buffer, const std::string &name);
     void generateTransferRoute(uint32_t srcNode, uint32_t dstNode, uint32_t core, route_t *&fwd, route_t *&rev);
     uint64_t getUplinkCsigAbw(uint32_t srcLeaf, uint32_t core);
+
+    extern std::vector<double> userFctsUs;
+
+    class UserFlowGenerator : public FlowGenerator
+    {
+        public:
+            UserFlowGenerator(DataSource::EndHost endhost, route_gen_t rg, linkspeed_bps flowRate,
+                              uint32_t avgFlowSize, Workloads::FlowDist flowSizeDist)
+                : FlowGenerator(endhost, rg, flowRate, avgFlowSize, flowSizeDist) {}
+
+            virtual void finishFlow(uint32_t flow_id);
+    };
 
     /* End-of-run summary. */
     class RunStats : public EventSource
@@ -385,15 +398,15 @@ autoscale_testbed(const ArgList &args, Logfile &logfile)
      * over [surgestart, surgeend] carrying the extra offered load. The two
      * compose to base -> peak -> base. */
 
-    FlowGenerator *baseGen =
-        new FlowGenerator(eh, generateRoute, speedFromGbps(BaseLoad), AvgFlowSize, fd);
+    UserFlowGenerator *baseGen =
+        new UserFlowGenerator(eh, generateRoute, speedFromGbps(BaseLoad), AvgFlowSize, fd);
     baseGen->setPrefix("base-");
     baseGen->setTimeLimits(timeFromUs(1), genEnd);
 
     double surgeDelta = PeakLoad - BaseLoad;
     if (surgeDelta > 0 && SurgeEnd > SurgeStart) {
-        FlowGenerator *surgeGen =
-            new FlowGenerator(eh, generateRoute, speedFromGbps(surgeDelta), AvgFlowSize, fd);
+        UserFlowGenerator *surgeGen =
+            new UserFlowGenerator(eh, generateRoute, speedFromGbps(surgeDelta), AvgFlowSize, fd);
         surgeGen->setPrefix("surge-");
         surgeGen->setTimeLimits(timeFromSec(SurgeStart), timeFromSec(SurgeEnd));
     }
@@ -548,6 +561,21 @@ autoscale::RunStats::doNextEvent()
     }
     double imbalance = (used > 0 && sum > 0) ? mx / (sum / (double)used) : 0.0;
 
+    /* User request latency stats */
+    double fctMean = 0.0, fctP50 = 0.0, fctP90 = 0.0, fctP99 = 0.0, fctMax = 0.0;
+    if (!userFctsUs.empty()) {
+        vector<double> sortedFcts = userFctsUs;
+        sort(sortedFcts.begin(), sortedFcts.end());
+        size_t n = sortedFcts.size();
+        double sumFct = 0.0;
+        for (double v : sortedFcts) sumFct += v;
+        fctMean = sumFct / n;
+        fctP50 = sortedFcts[(size_t)(n * 0.50)];
+        fctP90 = sortedFcts[(size_t)(n * 0.90) < n ? (size_t)(n * 0.90) : n - 1];
+        fctP99 = sortedFcts[(size_t)(n * 0.99) < n ? (size_t)(n * 0.99) : n - 1];
+        fctMax = sortedFcts.back();
+    }
+
     cout << fixed << setprecision(4)
          << "RunStats tag " << _tag
          << " final_active " << finalActive
@@ -559,10 +587,30 @@ autoscale::RunStats::doNextEvent()
          << " servers_used " << used
          << " backend_maxmean " << imbalance
          << " fabric_bytes " << fabricBytes
+         << " user_requests " << userFctsUs.size()
+         << " fct_mean_us " << fctMean
+         << " fct_p50_us " << fctP50
+         << " fct_p90_us " << fctP90
+         << " fct_p99_us " << fctP99
+         << " fct_max_us " << fctMax
          << " scaler_ticks " << scaler->_ticks
          << " scale_ups " << scaler->_upActions
          << " scale_downs " << scaler->_downActions
          << endl;
+}
+
+std::vector<double> autoscale::userFctsUs;
+
+void
+autoscale::UserFlowGenerator::finishFlow(uint32_t flow_id)
+{
+    auto it = _liveFlows.find(flow_id);
+    if (it != _liveFlows.end()) {
+        DataSource *src = it->second;
+        simtime_picosec fct = EventList::Get().now() - src->_start_time;
+        userFctsUs.push_back(timeAsUs(fct));
+    }
+    FlowGenerator::finishFlow(flow_id);
 }
 
 Pipe *

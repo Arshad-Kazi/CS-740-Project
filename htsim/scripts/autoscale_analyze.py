@@ -44,6 +44,8 @@ def parse(path):
             m = FLOW_RE.match(line)
             if m:
                 name, _fid, size, start, end, fct = m.groups()
+                if name.startswith("transfer") or name.startswith("wt-") or name.startswith("warm"):
+                    continue
                 flows.append({
                     "gen": "surge" if name.startswith("surge") else "base",
                     "size": int(size),

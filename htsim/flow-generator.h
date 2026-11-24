@@ -82,7 +82,9 @@ class FlowGenerator : public EventSource
         std::deque<std::pair<simtime_picosec, uint64_t> > _flowTrace;
 
         // List of live flows in the system.
+    protected:
         std::unordered_map<uint32_t,DataSource*> _liveFlows;
+    private:
 
         // Average flow inter-arrival time, computed using arguments.
         simtime_picosec _avgFlowArrivalTime;
