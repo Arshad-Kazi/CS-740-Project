@@ -28,8 +28,30 @@ class Packet
         PP_FIRST = 2,
         DEADLINE = 3
     };
+    // TODO: replace CONGA headers with CSIG headers
+    // CSIG headers and correspondding methods have been added, will be used in the future once CSIG is implemented in the switches and scheduler.
+    static const uint64_t CSIG_NONE = UINT64_MAX;   // "no signal yet"
+
+    bool      csig_enabled() const { return _csig_enabled; }
+    uint64_t  csig_abw_bps() const { return _csig_abw_bps; }
+    uint32_t  csig_locator() const { return _csig_locator; }
 
     Packet() {};
+
+    void csig_init() {
+        _csig_enabled = true;
+        _csig_abw_bps = CSIG_NONE;      // identity element for min()
+        _csig_locator = 0;
+    }
+
+    // Compare-and-replace: called by each switch egress queue
+    void csig_update(uint64_t local_abw_bps, uint32_t locator) {
+        if (_csig_enabled && local_abw_bps < _csig_abw_bps) {
+            _csig_abw_bps = local_abw_bps;
+            _csig_locator = locator;
+        }
+    }
+
     virtual ~Packet() {};
 
     // Free the packet and return it to packet pool.
@@ -67,6 +89,10 @@ class Packet
     } conga;
 
     protected:
+    bool     _csig_enabled = false;
+    uint64_t _csig_abw_bps = CSIG_NONE;
+    uint32_t _csig_locator = 0;
+
     void set(PacketFlow &flow, route_t &route, mem_b pkt_size, packetid_t id);
 
     PacketFlow *_flow;

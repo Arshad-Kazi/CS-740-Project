@@ -51,6 +51,8 @@
 #include "leafswitch.h"
 #include "server-pool.h"
 #include "autoscaler.h"
+#include "csig-queue.h"
+#include "weight-transfer-pool.h"
 
 #include <iomanip>
 #include <random>
@@ -86,10 +88,10 @@ namespace autoscale {
     std::vector<std::vector<Queue*> >    qLeafClient;
     std::vector<std::vector<Pipe*> >     pLeafClient;
 
-    std::vector<std::vector<DreQueue*> > qLeafCore;     // [leaf][core]
-    std::vector<std::vector<Pipe*> >     pLeafCore;
-    std::vector<std::vector<DreQueue*> > qCoreLeaf;     // [core][leaf]
-    std::vector<std::vector<Pipe*> >     pCoreLeaf;
+    std::vector<std::vector<CsigQueue*> > qLeafCore;     // [leaf][core]
+    std::vector<std::vector<Pipe*> >      pLeafCore;
+    std::vector<std::vector<CsigQueue*> > qCoreLeaf;     // [core][leaf]
+    std::vector<std::vector<Pipe*> >      pCoreLeaf;
 
     std::vector<LeafSwitch*> leafSwitch;
 
@@ -97,6 +99,7 @@ namespace autoscale {
     PathLb pathLb = ECMP;
 
     ServerPool *pool = NULL;
+    WeightTransferPool *wtPool = NULL;
     AutoScaler *scaler = NULL;
 
     /* Path/server decisions draw from their own RNG so that runs with the
@@ -119,6 +122,9 @@ namespace autoscale {
     Pipe *makePipe(const std::string &name);
     Queue *makeQueue(uint64_t speed, uint64_t buffer, const std::string &name);
     DreQueue *makeDreQueue(uint64_t speed, uint64_t buffer, const std::string &name);
+    CsigQueue *makeCsigQueue(uint64_t speed, uint64_t buffer, const std::string &name);
+    void generateTransferRoute(uint32_t srcNode, uint32_t dstNode, uint32_t core, route_t *&fwd, route_t *&rev);
+    uint64_t getUplinkCsigAbw(uint32_t srcLeaf, uint32_t core);
 
     /* End-of-run summary. */
     class RunStats : public EventSource
@@ -158,6 +164,11 @@ autoscale_testbed(const ArgList &args, Logfile &logfile)
     string LbServer = "p2c";
     string LbPath   = "ecmp";
     string ScalePolicy = "target";
+    string ScaleMode = "fixed";      // "fixed" (timer bootdelay) or "transfer" (weight transfer)
+    double ModelSizeMB = 50.0;       // parameter set size in MB
+    double ModelFraction = 0.10;     // fraction of model parameters to copy (e.g. 10%)
+    uint32_t TransferK = 4;          // number of active donor nodes
+    uint32_t TransferChunkSize = 100000; // chunk size in bytes
     double ScaleUp = 0.70, ScaleDown = 0.30, ScaleTarget = 0.60;
     uint32_t StepUp = 4, StepDown = 1;
     double CooldownUpMs = 0.0, CooldownDownMs = 20.0;
@@ -188,6 +199,11 @@ autoscale_testbed(const ArgList &args, Logfile &logfile)
     parseString(args, "lb_server", LbServer);
     parseString(args, "lb_path", LbPath);
     parseString(args, "scaler", ScalePolicy);
+    parseString(args, "scale_mode", ScaleMode);
+    parseDouble(args, "model_size", ModelSizeMB);
+    parseDouble(args, "model_fraction", ModelFraction);
+    parseInt(args, "transfer_k", TransferK);
+    parseInt(args, "chunk_size", TransferChunkSize);
     parseDouble(args, "scale_up", ScaleUp);
     parseDouble(args, "scale_down", ScaleDown);
     parseDouble(args, "scale_target", ScaleTarget);
@@ -306,17 +322,17 @@ autoscale_testbed(const ArgList &args, Logfile &logfile)
         }
     }
 
-    qLeafCore.assign(nLeaf, vector<DreQueue*>(nCore, NULL));
+    qLeafCore.assign(nLeaf, vector<CsigQueue*>(nCore, NULL));
     pLeafCore.assign(nLeaf, vector<Pipe*>(nCore, NULL));
-    qCoreLeaf.assign(nCore, vector<DreQueue*>(nLeaf, NULL));
+    qCoreLeaf.assign(nCore, vector<CsigQueue*>(nLeaf, NULL));
     pCoreLeaf.assign(nCore, vector<Pipe*>(nLeaf, NULL));
 
     for (uint32_t l = 0; l < nLeaf; l++) {
         for (uint32_t c = 0; c < nCore; c++) {
             string id = to_string(l) + "-" + to_string(c);
-            qLeafCore[l][c] = makeDreQueue(FABRIC_SPEED, FABRIC_BUFFER, "q-leaf-core-" + id);
+            qLeafCore[l][c] = makeCsigQueue(FABRIC_SPEED, FABRIC_BUFFER, "q-leaf-core-" + id);
             pLeafCore[l][c] = makePipe("p-leaf-core-" + id);
-            qCoreLeaf[c][l] = makeDreQueue(FABRIC_SPEED, FABRIC_BUFFER, "q-core-leaf-" + id);
+            qCoreLeaf[c][l] = makeCsigQueue(FABRIC_SPEED, FABRIC_BUFFER, "q-core-leaf-" + id);
             pCoreLeaf[c][l] = makePipe("p-core-leaf-" + id);
         }
     }
@@ -331,16 +347,31 @@ autoscale_testbed(const ArgList &args, Logfile &logfile)
 
     /* ---- Elastic fleet ---- */
 
-    pool = new ServerPool(maxBackends, InitServers, timeFromMs(BootDelayMs));
-    pool->setPolicy(serverPolicy);
-    for (uint32_t b = 0; b < maxBackends; b++) {
-        pool->setEgressQueue(b, qBackendLeaf[backendLeaf(b)][backendSlot(b)]);
+    ElasticFleet *activeFleet = NULL;
+    if (ScaleMode == "transfer") {
+        uint64_t modelBytes = (uint64_t)(ModelSizeMB * 1000000.0);
+        wtPool = new WeightTransferPool(maxBackends, InitServers, nLeaf, nCore,
+                                        modelBytes, ModelFraction, TransferK,
+                                        TransferChunkSize, eh, generateTransferRoute,
+                                        getUplinkCsigAbw);
+        wtPool->setPolicy(serverPolicy);
+        for (uint32_t b = 0; b < maxBackends; b++) {
+            wtPool->setEgressQueue(b, qBackendLeaf[backendLeaf(b)][backendSlot(b)]);
+        }
+        activeFleet = wtPool;
+    } else {
+        pool = new ServerPool(maxBackends, InitServers, timeFromMs(BootDelayMs));
+        pool->setPolicy(serverPolicy);
+        for (uint32_t b = 0; b < maxBackends; b++) {
+            pool->setEgressQueue(b, qBackendLeaf[backendLeaf(b)][backendSlot(b)]);
+        }
+        activeFleet = pool;
     }
 
     simtime_picosec genEnd = timeFromSec(Duration);
     simtime_picosec endTime = timeFromSec(Duration + Drain);
 
-    scaler = new AutoScaler(pool, scalerPolicy, timeFromMs(ControlMs));
+    scaler = new AutoScaler(activeFleet, scalerPolicy, timeFromMs(ControlMs));
     scaler->setThresholds(ScaleUp, ScaleDown);
     scaler->setTarget(ScaleTarget);
     scaler->setStep(StepUp, StepDown);
@@ -420,7 +451,7 @@ autoscale::generateRoute(route_t *&fwd,
                          uint32_t &src,
                          uint32_t &dst)
 {
-    int b = pool->select(lbRng);
+    int b = wtPool ? wtPool->select(lbRng) : pool->select(lbRng);
     if (b < 0) {
         b = 0; // pool never empties, but never dereference -1
     }
@@ -487,7 +518,12 @@ void
 autoscale::RunStats::doNextEvent()
 {
     /* Server-seconds: the cost of the scaling decisions over the run. */
-    double serverSec = pool->serverSeconds();
+    double serverSec = wtPool ? wtPool->serverSeconds() : pool->serverSeconds();
+    uint32_t finalActive = wtPool ? wtPool->nActive() : pool->nActive();
+    uint32_t maxS = wtPool ? wtPool->maxServers() : pool->maxServers();
+    uint64_t nStarts = wtPool ? wtPool->_starts : pool->_starts;
+    uint64_t nStops = wtPool ? wtPool->_stops : pool->_stops;
+    uint64_t dispatches = wtPool ? wtPool->_dispatches : pool->_dispatches;
 
     uint64_t fabricBytes = 0;
     for (uint32_t l = 0; l < nLeaf; l++) {
@@ -514,12 +550,12 @@ autoscale::RunStats::doNextEvent()
 
     cout << fixed << setprecision(4)
          << "RunStats tag " << _tag
-         << " final_active " << pool->nActive()
-         << " max_servers " << pool->maxServers()
-         << " starts " << pool->_starts
-         << " stops " << pool->_stops
+         << " final_active " << finalActive
+         << " max_servers " << maxS
+         << " starts " << nStarts
+         << " stops " << nStops
          << " server_seconds " << serverSec
-         << " dispatches " << pool->_dispatches
+         << " dispatches " << dispatches
          << " servers_used " << used
          << " backend_maxmean " << imbalance
          << " fabric_bytes " << fabricBytes
@@ -551,4 +587,59 @@ autoscale::makeDreQueue(uint64_t speed, uint64_t buffer, const string &name)
     DreQueue *q = new DreQueue(speed, buffer, NULL);
     q->setName(name);
     return q;
+}
+
+CsigQueue *
+autoscale::makeCsigQueue(uint64_t speed, uint64_t buffer, const string &name)
+{
+    CsigQueue *q = new CsigQueue(speed, buffer, NULL);
+    q->setName(name);
+    return q;
+}
+
+void
+autoscale::generateTransferRoute(uint32_t srcNode,
+                                 uint32_t dstNode,
+                                 uint32_t core,
+                                 route_t *&fwd,
+                                 route_t *&rev)
+{
+    uint32_t srcLeaf = backendLeaf(srcNode), srcSlot = backendSlot(srcNode);
+    uint32_t dstLeaf = backendLeaf(dstNode), dstSlot = backendSlot(dstNode);
+
+    fwd = new route_t();
+    rev = new route_t();
+
+    /* Forward route: src backend -> src leaf -> [core] -> dst leaf -> dst backend */
+    fwd->push_back(qBackendLeaf[srcLeaf][srcSlot]);
+    fwd->push_back(pBackendLeaf[srcLeaf][srcSlot]);
+    if (srcLeaf != dstLeaf) {
+        fwd->push_back(qLeafCore[srcLeaf][core]);
+        fwd->push_back(pLeafCore[srcLeaf][core]);
+        fwd->push_back(qCoreLeaf[core][dstLeaf]);
+        fwd->push_back(pCoreLeaf[core][dstLeaf]);
+    }
+    fwd->push_back(qLeafBackend[dstLeaf][dstSlot]);
+    fwd->push_back(pLeafBackend[dstLeaf][dstSlot]);
+
+    /* Reverse route: dst backend -> dst leaf -> [core] -> src leaf -> src backend */
+    rev->push_back(qBackendLeaf[dstLeaf][dstSlot]);
+    rev->push_back(pBackendLeaf[dstLeaf][dstSlot]);
+    if (srcLeaf != dstLeaf) {
+        rev->push_back(qLeafCore[dstLeaf][core]);
+        rev->push_back(pLeafCore[dstLeaf][core]);
+        rev->push_back(qCoreLeaf[core][srcLeaf]);
+        rev->push_back(pCoreLeaf[core][srcLeaf]);
+    }
+    rev->push_back(qLeafBackend[srcLeaf][srcSlot]);
+    rev->push_back(pLeafBackend[srcLeaf][srcSlot]);
+}
+
+uint64_t
+autoscale::getUplinkCsigAbw(uint32_t srcLeaf, uint32_t core)
+{
+    if (srcLeaf < nLeaf && core < nCore && qLeafCore[srcLeaf][core]) {
+        return qLeafCore[srcLeaf][core]->currentAbwBps();
+    }
+    return 0;
 }

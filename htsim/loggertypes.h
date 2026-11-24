@@ -3,6 +3,7 @@
  */
 #ifndef LOGGERTYPES_H
 #define LOGGERTYPES_H
+#include <cstdint>
 
 #include <string>
 
