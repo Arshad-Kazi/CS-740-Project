@@ -11,3 +11,8 @@ htsim/results_*/logs/
 
 # local
 .DS_Store
+
+# Personal notes
+notes
+notes.txt
+notes.md
