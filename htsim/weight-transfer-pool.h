@@ -41,6 +41,13 @@ class WeightTransferPool : public EventSource, public ElasticFleet
 {
     public:
         enum State { OFF, BOOTING, ACTIVE };
+        enum TransferMode {
+            K_PEERS,       // k active donors, capacity-WRR + CSIG-WRR across cores
+            SINGLE_DONOR,  // 1 active donor sends all chunks to booting nodes + CSIG-WRR
+            RELAY          // 1 initial donor -> fanout F booting nodes -> pipelined relay tree
+        };
+
+        static bool parseTransferMode(const std::string &s, TransferMode &out);
 
         WeightTransferPool(uint32_t maxServers,
                            uint32_t initialActive,
@@ -52,7 +59,9 @@ class WeightTransferPool : public EventSource, public ElasticFleet
                            uint64_t chunkSize,
                            DataSource::EndHost endhost,
                            transfer_route_gen_t routeGen,
-                           csig_metric_fn_t csigMetricFn);
+                           csig_metric_fn_t csigMetricFn,
+                           TransferMode mode = K_PEERS,
+                           uint32_t transferFanout = 2);
         virtual ~WeightTransferPool();
 
         void setPolicy(ServerPool::LbPolicy p) { _policy = p; }
@@ -91,6 +100,16 @@ class WeightTransferPool : public EventSource, public ElasticFleet
     private:
         void accrueServerTime();
         void startTransfersForNode(uint32_t dstNode);
+        void startSingleDonorBatch(const std::vector<uint32_t> &bootNodes);
+        void startRelayBatch(const std::vector<uint32_t> &bootNodes);
+        int pickBestDonor(uint32_t excludeNode);
+        std::vector<uint64_t> buildChunkSizes() const;
+        uint32_t sendAllChunksFromDonor(uint32_t srcNode, uint32_t dstNode,
+                                        const std::vector<uint64_t> &chunkSizes);
+        bool launchChunkFlow(uint32_t srcNode, uint32_t dstNode, uint32_t core,
+                             uint32_t chunkIdx, uint64_t sz);
+        uint32_t pickCoreOnlineCsigWrr(uint32_t srcNode, uint32_t dstNode);
+        void promoteToActive(uint32_t node);
         inline uint32_t backendLeaf(uint32_t b) const { return b % _nLeaf; }
 
         uint32_t _maxServers;
@@ -104,6 +123,8 @@ class WeightTransferPool : public EventSource, public ElasticFleet
         DataSource::EndHost _endhost;
         transfer_route_gen_t _routeGen;
         csig_metric_fn_t _csigMetricFn;
+        TransferMode _transferMode;
+        uint32_t _transferFanout;
 
         ServerPool::LbPolicy _policy;
         std::vector<State> _state;
@@ -125,9 +146,15 @@ class WeightTransferPool : public EventSource, public ElasticFleet
             uint32_t dstNode;
             uint32_t srcNode;
             uint32_t core;
+            uint32_t chunkIdx;
             uint64_t size;
         };
         std::map<uint32_t, ChunkInfo> _inFlightChunks; // flow_id -> ChunkInfo
+
+        // Relay tree state: children that receive chunks from a booting node
+        std::map<uint32_t, std::vector<uint32_t> > _relayChildren;
+        // Online Smooth WRR state per (srcNode, dstNode) for relayed chunks
+        std::map<std::pair<uint32_t, uint32_t>, std::vector<double> > _onlineCoreWrr;
 
         // Helper FlowGenerator to capture finishFlow callbacks from TcpSrc
         class TransferFlowGenerator : public FlowGenerator

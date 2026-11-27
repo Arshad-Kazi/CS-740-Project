@@ -31,6 +31,22 @@
 --logfile=: # log file
 --utilization: # faction number (0, 1)
 
+# autoscale weight-transfer parameters (--expt=4)
+--scale_mode:
+    val=fixed # default: fixed timer boot delay (--bootdelay)
+    val=transfer # model weight transfer over the fabric using CSIG
+
+--transfer_mode: # used when --scale_mode=transfer
+    val=k_peers # default: k active donors chosen by capacity WRR, chunks distributed across cores via CSIG WRR
+    val=single # 1 highest-capacity active donor sends all chunks to booting nodes via CSIG WRR
+    val=relay # 1 initial active donor -> fanout F booting nodes -> pipelined relay tree via CSIG WRR
+
+--model_size: # simulated full LLM parameter set size in MB (default: 50.0)
+--model_fraction: # fraction of model_size transferred per booting node (default: 0.10)
+--transfer_k: # number of active donor nodes in k_peers mode (default: 4)
+--transfer_fanout: # number of child booting nodes per parent in relay mode (default: 2)
+--chunk_size: # size of each parameter transfer chunk in bytes (default: 100000)
+
 # log format
 ## type1: flow start
 <flow name> <start time> <flow ID> <flow size> <src_node> <des_nod>

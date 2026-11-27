@@ -4,6 +4,7 @@
 #include "weight-transfer-pool.h"
 
 #include <algorithm>
+#include <deque>
 #include <iostream>
 
 using namespace std;
@@ -68,6 +69,15 @@ WeightTransferPool::TransferFlowGenerator::finishFlow(uint32_t flow_id)
     _pool->onFlowFinished(flow_id);
 }
 
+bool
+WeightTransferPool::parseTransferMode(const string &s, TransferMode &out)
+{
+    if (s == "k_peers" || s == "kpeers") { out = K_PEERS;      return true; }
+    if (s == "single")                   { out = SINGLE_DONOR; return true; }
+    if (s == "relay" || s == "tree")     { out = RELAY;        return true; }
+    return false;
+}
+
 WeightTransferPool::WeightTransferPool(uint32_t maxServers,
                                        uint32_t initialActive,
                                        uint32_t nLeaf,
@@ -78,7 +88,9 @@ WeightTransferPool::WeightTransferPool(uint32_t maxServers,
                                        uint64_t chunkSize,
                                        DataSource::EndHost endhost,
                                        transfer_route_gen_t routeGen,
-                                       csig_metric_fn_t csigMetricFn)
+                                       csig_metric_fn_t csigMetricFn,
+                                       TransferMode mode,
+                                       uint32_t transferFanout)
     : EventSource("WeightTransferPool"),
       _dispatches(0),
       _starts(0),
@@ -95,6 +107,8 @@ WeightTransferPool::WeightTransferPool(uint32_t maxServers,
       _endhost(endhost),
       _routeGen(routeGen),
       _csigMetricFn(csigMetricFn),
+      _transferMode(mode),
+      _transferFanout(transferFanout > 0 ? transferFanout : 2),
       _policy(ServerPool::ROUND_ROBIN),
       _state(maxServers, OFF),
       _egress(maxServers, NULL),
@@ -146,20 +160,39 @@ uint32_t
 WeightTransferPool::scaleUp(uint32_t n)
 {
     accrueServerTime();
-    uint32_t started = 0;
+    vector<uint32_t> bootNodes;
 
-    for (uint32_t i = 0; i < _maxServers && started < n; i++) {
+    for (uint32_t i = 0; i < _maxServers && bootNodes.size() < n; i++) {
         if (_state[i] != OFF) {
             continue;
         }
         _state[i] = BOOTING;
         _nBooting++;
-        started++;
+        bootNodes.push_back(i);
+    }
 
-        startTransfersForNode(i);
+    uint32_t started = (uint32_t)bootNodes.size();
+    if (started == 0) {
+        return 0;
     }
 
     _starts += started;
+
+    switch (_transferMode) {
+        case SINGLE_DONOR:
+            startSingleDonorBatch(bootNodes);
+            break;
+        case RELAY:
+            startRelayBatch(bootNodes);
+            break;
+        case K_PEERS:
+        default:
+            for (uint32_t dstNode : bootNodes) {
+                startTransfersForNode(dstNode);
+            }
+            break;
+    }
+
     return started;
 }
 
@@ -181,17 +214,20 @@ WeightTransferPool::scaleDown(uint32_t n)
 }
 
 void
-WeightTransferPool::startTransfersForNode(uint32_t dstNode)
+WeightTransferPool::promoteToActive(uint32_t node)
 {
-    if (_transferBytes == 0 || _active.empty()) {
-        /* No bytes to transfer or no active peers available: become active immediately */
-        _state[dstNode] = ACTIVE;
-        _active.push_back(dstNode);
+    accrueServerTime();
+    if (_state[node] == BOOTING) {
+        _state[node] = ACTIVE;
+        _active.push_back(node);
         _nBooting--;
-        return;
     }
+    _booting.erase(node);
+}
 
-    /* 1. Calculate chunks and chunk sizes */
+vector<uint64_t>
+WeightTransferPool::buildChunkSizes() const
+{
     uint32_t totalChunks = (uint32_t)((_transferBytes + _chunkSize - 1) / _chunkSize);
     if (totalChunks == 0) totalChunks = 1;
 
@@ -202,6 +238,233 @@ WeightTransferPool::startTransfersForNode(uint32_t dstNode)
         chunkSizes[c] = sz;
         remainingBytes -= sz;
     }
+    return chunkSizes;
+}
+
+int
+WeightTransferPool::pickBestDonor(uint32_t excludeNode)
+{
+    int bestNode = -1;
+    double bestCap = -1.0;
+    for (uint32_t u : _active) {
+        if (u == excludeNode) continue;
+        double cap = max(0.001, 1.0 - load(u));
+        if (cap > bestCap) {
+            bestCap = cap;
+            bestNode = (int)u;
+        }
+    }
+    return bestNode;
+}
+
+bool
+WeightTransferPool::launchChunkFlow(uint32_t srcNode,
+                                    uint32_t dstNode,
+                                    uint32_t core,
+                                    uint32_t chunkIdx,
+                                    uint64_t sz)
+{
+    route_t *fwd = NULL, *rev = NULL;
+    _routeGen(srcNode, dstNode, core, fwd, rev);
+    if (!fwd || !rev) {
+        return false;
+    }
+
+    TcpSrc *src = new TcpSrc(NULL, NULL, (uint32_t)sz);
+    TcpSink *snk = new TcpSink();
+    if (_endhost == DataSource::DCTCP) {
+        TcpSrc::_enable_dctcp = true;
+    }
+
+    src->setName("transfer-src" + to_string(_flowSeq));
+    snk->setName("transfer-snk" + to_string(_flowSeq));
+    _flowSeq++;
+
+    src->_node_id = srcNode;
+    snk->_node_id = dstNode;
+
+    fwd->push_back(snk);
+    rev->push_back(src);
+
+    src->connect(EventList::Get().now() + 1, *fwd, *rev, *snk);
+    src->setFlowGenerator(_flowGen);
+
+    ChunkInfo ci;
+    ci.dstNode = dstNode;
+    ci.srcNode = srcNode;
+    ci.core = core;
+    ci.chunkIdx = chunkIdx;
+    ci.size = sz;
+    _inFlightChunks[src->id] = ci;
+    return true;
+}
+
+uint32_t
+WeightTransferPool::sendAllChunksFromDonor(uint32_t srcNode,
+                                           uint32_t dstNode,
+                                           const vector<uint64_t> &chunkSizes)
+{
+    uint32_t x = (uint32_t)chunkSizes.size();
+    uint32_t srcLeaf = backendLeaf(srcNode);
+    uint32_t dstLeaf = backendLeaf(dstNode);
+
+    vector<uint32_t> coreSchedule;
+    if (srcLeaf == dstLeaf) {
+        coreSchedule.assign(x, 0);
+    } else {
+        vector<double> coreWeights(_nCore, 1.0);
+        for (uint32_t c = 0; c < _nCore; c++) {
+            uint64_t abw = _csigMetricFn ? _csigMetricFn(srcLeaf, c) : 0;
+            coreWeights[c] = (abw > 0) ? (double)abw : 1.0;
+        }
+        coreSchedule = weightedRoundRobinSchedule(x, coreWeights);
+    }
+
+    uint32_t launched = 0;
+    for (uint32_t j = 0; j < x; j++) {
+        if (launchChunkFlow(srcNode, dstNode, coreSchedule[j], j, chunkSizes[j])) {
+            launched++;
+        }
+    }
+    return launched;
+}
+
+uint32_t
+WeightTransferPool::pickCoreOnlineCsigWrr(uint32_t srcNode, uint32_t dstNode)
+{
+    uint32_t srcLeaf = backendLeaf(srcNode);
+    uint32_t dstLeaf = backendLeaf(dstNode);
+    if (srcLeaf == dstLeaf || _nCore <= 1) {
+        return 0;
+    }
+
+    vector<double> weights(_nCore, 1.0);
+    double sumWeight = 0.0;
+    for (uint32_t c = 0; c < _nCore; c++) {
+        uint64_t abw = _csigMetricFn ? _csigMetricFn(srcLeaf, c) : 0;
+        weights[c] = (abw > 0) ? (double)abw : 1.0;
+        sumWeight += weights[c];
+    }
+
+    pair<uint32_t, uint32_t> key(srcNode, dstNode);
+    vector<double> &current = _onlineCoreWrr[key];
+    if (current.size() != _nCore) {
+        current = weights;
+    } else {
+        for (uint32_t c = 0; c < _nCore; c++) {
+            current[c] += weights[c];
+        }
+    }
+
+    uint32_t best = 0;
+    double maxVal = current[0];
+    for (uint32_t c = 1; c < _nCore; c++) {
+        if (current[c] > maxVal) {
+            maxVal = current[c];
+            best = c;
+        }
+    }
+    current[best] -= sumWeight;
+    return best;
+}
+
+void
+WeightTransferPool::startSingleDonorBatch(const vector<uint32_t> &bootNodes)
+{
+    if (_transferBytes == 0 || _active.empty()) {
+        for (uint32_t dstNode : bootNodes) {
+            promoteToActive(dstNode);
+        }
+        return;
+    }
+
+    int donor = pickBestDonor(UINT32_MAX);
+    if (donor < 0) {
+        for (uint32_t dstNode : bootNodes) {
+            promoteToActive(dstNode);
+        }
+        return;
+    }
+
+    vector<uint64_t> chunkSizes = buildChunkSizes();
+    for (uint32_t dstNode : bootNodes) {
+        uint32_t launched = sendAllChunksFromDonor((uint32_t)donor, dstNode, chunkSizes);
+        if (launched == 0) {
+            promoteToActive(dstNode);
+        } else {
+            _booting[dstNode] = {launched, EventList::Get().now()};
+        }
+    }
+}
+
+void
+WeightTransferPool::startRelayBatch(const vector<uint32_t> &bootNodes)
+{
+    if (_transferBytes == 0 || _active.empty()) {
+        for (uint32_t dstNode : bootNodes) {
+            promoteToActive(dstNode);
+        }
+        return;
+    }
+
+    int donor = pickBestDonor(UINT32_MAX);
+    if (donor < 0) {
+        for (uint32_t dstNode : bootNodes) {
+            promoteToActive(dstNode);
+        }
+        return;
+    }
+
+    vector<uint64_t> chunkSizes = buildChunkSizes();
+    uint32_t totalChunks = (uint32_t)chunkSizes.size();
+    simtime_picosec now = EventList::Get().now();
+
+    /* Build BFS relay tree of fanout _transferFanout rooted at `donor`. */
+    deque<uint32_t> parents;
+    parents.push_back((uint32_t)donor);
+    size_t idx = 0;
+    vector<uint32_t> rootChildren;
+
+    while (idx < bootNodes.size() && !parents.empty()) {
+        uint32_t parent = parents.front();
+        parents.pop_front();
+
+        for (uint32_t f = 0; f < _transferFanout && idx < bootNodes.size(); f++) {
+            uint32_t child = bootNodes[idx++];
+            _booting[child] = {totalChunks, now};
+            parents.push_back(child);
+
+            if (parent == (uint32_t)donor) {
+                rootChildren.push_back(child);
+            } else {
+                _relayChildren[parent].push_back(child);
+            }
+        }
+    }
+
+    /* Initial donor immediately starts sending all chunks to its direct children. */
+    for (uint32_t child : rootChildren) {
+        uint32_t launched = sendAllChunksFromDonor((uint32_t)donor, child, chunkSizes);
+        if (launched == 0) {
+            promoteToActive(child);
+        } else {
+            _booting[child].chunksRemaining = launched;
+        }
+    }
+}
+
+void
+WeightTransferPool::startTransfersForNode(uint32_t dstNode)
+{
+    if (_transferBytes == 0 || _active.empty()) {
+        /* No bytes to transfer or no active peers available: become active immediately */
+        promoteToActive(dstNode);
+        return;
+    }
+
+    /* 1. Calculate chunks and chunk sizes */
+    vector<uint64_t> chunkSizes = buildChunkSizes();
+    uint32_t totalChunks = (uint32_t)chunkSizes.size();
 
     /* 2. Choose up to k active nodes that have available compute capacity */
     struct Candidate {
@@ -218,9 +481,7 @@ WeightTransferPool::startTransfersForNode(uint32_t dstNode)
     }
 
     if (candidates.empty()) {
-        _state[dstNode] = ACTIVE;
-        _active.push_back(dstNode);
-        _nBooting--;
+        promoteToActive(dstNode);
         return;
     }
 
@@ -239,11 +500,11 @@ WeightTransferPool::startTransfersForNode(uint32_t dstNode)
     }
     vector<uint32_t> nodeSchedule = weightedRoundRobinSchedule(totalChunks, nodeWeights);
 
-    // Group chunk sizes per donor node
-    vector<vector<uint64_t> > donorChunks(m);
+    // Group (chunkIdx, size) per donor node
+    vector<vector<pair<uint32_t, uint64_t> > > donorChunks(m);
     for (uint32_t c = 0; c < totalChunks; c++) {
         uint32_t donorIdx = nodeSchedule[c];
-        donorChunks[donorIdx].push_back(chunkSizes[c]);
+        donorChunks[donorIdx].push_back({c, chunkSizes[c]});
     }
 
     /* 4. For each sending node N with x chunks, distribute chunks across cores using WRR based on CSIG ABW */
@@ -274,47 +535,17 @@ WeightTransferPool::startTransfersForNode(uint32_t dstNode)
         // Launch chunk flows
         for (uint32_t j = 0; j < x; j++) {
             uint32_t core = coreSchedule[j];
-            uint64_t sz = donorChunks[i][j];
+            uint32_t chunkIdx = donorChunks[i][j].first;
+            uint64_t sz = donorChunks[i][j].second;
 
-            route_t *fwd = NULL, *rev = NULL;
-            _routeGen(srcNode, dstNode, core, fwd, rev);
-            if (!fwd || !rev) {
-                continue;
+            if (launchChunkFlow(srcNode, dstNode, core, chunkIdx, sz)) {
+                actualFlowsLaunched++;
             }
-
-            TcpSrc *src = new TcpSrc(NULL, NULL, (uint32_t)sz);
-            TcpSink *snk = new TcpSink();
-            if (_endhost == DataSource::DCTCP) {
-                TcpSrc::_enable_dctcp = true;
-            }
-
-            src->setName("transfer-src" + to_string(_flowSeq));
-            snk->setName("transfer-snk" + to_string(_flowSeq));
-            _flowSeq++;
-
-            src->_node_id = srcNode;
-            snk->_node_id = dstNode;
-
-            fwd->push_back(snk);
-            rev->push_back(src);
-
-            src->connect(EventList::Get().now() + 1, *fwd, *rev, *snk);
-            src->setFlowGenerator(_flowGen);
-
-            ChunkInfo ci;
-            ci.dstNode = dstNode;
-            ci.srcNode = srcNode;
-            ci.core = core;
-            ci.size = sz;
-            _inFlightChunks[src->id] = ci;
-            actualFlowsLaunched++;
         }
     }
 
     if (actualFlowsLaunched == 0) {
-        _state[dstNode] = ACTIVE;
-        _active.push_back(dstNode);
-        _nBooting--;
+        promoteToActive(dstNode);
     } else {
         _booting[dstNode] = {actualFlowsLaunched, EventList::Get().now()};
     }
@@ -329,8 +560,19 @@ WeightTransferPool::onFlowFinished(uint32_t flowId)
     }
 
     uint32_t dstNode = it->second.dstNode;
+    uint32_t chunkIdx = it->second.chunkIdx;
+    uint64_t sz = it->second.size;
     _inFlightChunks.erase(it);
     _chunksTransferred++;
+
+    /* In RELAY mode, immediately forward this chunk to any child booting nodes */
+    map<uint32_t, vector<uint32_t> >::iterator rIt = _relayChildren.find(dstNode);
+    if (rIt != _relayChildren.end()) {
+        for (uint32_t child : rIt->second) {
+            uint32_t core = pickCoreOnlineCsigWrr(dstNode, child);
+            launchChunkFlow(dstNode, child, core, chunkIdx, sz);
+        }
+    }
 
     map<uint32_t, BootingRecord>::iterator bIt = _booting.find(dstNode);
     if (bIt == _booting.end()) {
@@ -339,12 +581,9 @@ WeightTransferPool::onFlowFinished(uint32_t flowId)
 
     bIt->second.chunksRemaining--;
     if (bIt->second.chunksRemaining == 0) {
-        /* All chunks received! Promote node to ACTIVE */
-        accrueServerTime();
-        _state[dstNode] = ACTIVE;
-        _active.push_back(dstNode);
-        _nBooting--;
-        _booting.erase(bIt);
+        /* All chunks received! Promote node to ACTIVE and clean up relay state */
+        _relayChildren.erase(dstNode);
+        promoteToActive(dstNode);
     }
 }
 

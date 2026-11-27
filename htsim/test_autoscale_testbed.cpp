@@ -178,9 +178,11 @@ autoscale_testbed(const ArgList &args, Logfile &logfile)
     string LbPath   = "ecmp";
     string ScalePolicy = "target";
     string ScaleMode = "fixed";      // "fixed" (timer bootdelay) or "transfer" (weight transfer)
+    string TransferModeStr = "k_peers"; // "k_peers", "single", or "relay"
     double ModelSizeMB = 50.0;       // parameter set size in MB
     double ModelFraction = 0.10;     // fraction of model parameters to copy (e.g. 10%)
-    uint32_t TransferK = 4;          // number of active donor nodes
+    uint32_t TransferK = 4;          // number of active donor nodes (k_peers mode)
+    uint32_t TransferFanout = 2;     // relay fanout (relay mode)
     uint32_t TransferChunkSize = 100000; // chunk size in bytes
     double ScaleUp = 0.70, ScaleDown = 0.30, ScaleTarget = 0.60;
     uint32_t StepUp = 4, StepDown = 1;
@@ -213,9 +215,11 @@ autoscale_testbed(const ArgList &args, Logfile &logfile)
     parseString(args, "lb_path", LbPath);
     parseString(args, "scaler", ScalePolicy);
     parseString(args, "scale_mode", ScaleMode);
+    parseString(args, "transfer_mode", TransferModeStr);
     parseDouble(args, "model_size", ModelSizeMB);
     parseDouble(args, "model_fraction", ModelFraction);
     parseInt(args, "transfer_k", TransferK);
+    parseInt(args, "transfer_fanout", TransferFanout);
     parseInt(args, "chunk_size", TransferChunkSize);
     parseDouble(args, "scale_up", ScaleUp);
     parseDouble(args, "scale_down", ScaleDown);
@@ -360,13 +364,20 @@ autoscale_testbed(const ArgList &args, Logfile &logfile)
 
     /* ---- Elastic fleet ---- */
 
+    WeightTransferPool::TransferMode transferMode = WeightTransferPool::K_PEERS;
+    if (!WeightTransferPool::parseTransferMode(TransferModeStr, transferMode)) {
+        cerr << "Unknown --transfer_mode=" << TransferModeStr
+             << " (expected k_peers, single, or relay)" << endl;
+        exit(1);
+    }
+
     ElasticFleet *activeFleet = NULL;
     if (ScaleMode == "transfer") {
         uint64_t modelBytes = (uint64_t)(ModelSizeMB * 1000000.0);
         wtPool = new WeightTransferPool(maxBackends, InitServers, nLeaf, nCore,
                                         modelBytes, ModelFraction, TransferK,
                                         TransferChunkSize, eh, generateTransferRoute,
-                                        getUplinkCsigAbw);
+                                        getUplinkCsigAbw, transferMode, TransferFanout);
         wtPool->setPolicy(serverPolicy);
         for (uint32_t b = 0; b < maxBackends; b++) {
             wtPool->setEgressQueue(b, qBackendLeaf[backendLeaf(b)][backendSlot(b)]);
